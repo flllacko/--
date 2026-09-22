@@ -53,13 +53,15 @@ from app.db.init_db import initialize_database
 from app.qa.generation import (
     GenerationError,
     _build_prompt,
+    finalize_stream_answer,
     generate_answer,
     has_reliable_evidence,
     reliable_evidence_hits,
     stream_ollama_chat,
     structure_answer,
 )
-from app.qa.query_routing import resolve_scope
+from app.qa.query_routing import is_greeting_query, resolve_scope
+from app.qa.dialogue import plan_dialogue, general_messages
 from app.qa.retrieval import RetrievalError, search_knowledge
 from app.processing.metadata import MetadataError, update_document_metadata
 from app.processing.deletion import DeletionError, DeletionService
@@ -120,6 +122,11 @@ app.add_middleware(
 )
 
 
+class DialogueMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(max_length=2000)
+
+
 class SearchRequest(BaseModel):
     question: str = Field(min_length=1, max_length=1000)
     scope: Literal["current", "historical", "navigation"] = "current"
@@ -127,6 +134,7 @@ class SearchRequest(BaseModel):
     identity: Literal["student", "parent", "teacher", "skip"] = "student"
     conversation_id: int | None = Field(default=None, ge=1)
     use_private_knowledge: bool = False
+    history: list[DialogueMessage] = Field(default_factory=list, max_length=8)
 
 
 class RegisterRequest(BaseModel):
@@ -298,8 +306,56 @@ def _sources_for_ranks(retrieval: dict[str, object], used_ranks: object) -> list
     return list(sources_by_document.values())
 
 
+def _greeting_answer() -> dict[str, object]:
+    return {
+        "conclusion": "你好！我是成都理工大学工程技术学院学生服务问答助手。你可以直接问我学生资助、教务、学生事务、招生、就业、公寓与校园生活等学校服务问题。",
+        "conditions": [],
+        "materials": [],
+        "steps": [],
+        "time": "",
+        "notes": ["涉及金额、截止日期和办理要求的问题，我会优先依据学校公开资料回答。"],
+        "follow_up_questions": [],
+    }
+
+
+def _greeting_payload(request: SearchRequest, http_request: Request, user, reply=None) -> dict[str, object]:
+    answer_body = _greeting_answer()
+    if reply is not None:
+        answer_body.update(conclusion=reply, notes=[])
+    saved, conversation_id = _save_answer_if_logged_in(
+        http_request, user, question=request.question, answer=answer_body,
+        answer_status="completed", sources=[], identity=request.identity,
+        conversation_id=request.conversation_id,
+    )
+    return {
+        "question": request.question.strip(),
+        "answer_status": "completed",
+        "answer": answer_body,
+        "sources": [],
+        "retrieval": {"hit_count": 0},
+        "saved": saved,
+        "conversation_id": conversation_id,
+    }
+
+
 def _sse(event: str, payload: dict[str, object]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _dialogue_plan(request, user, draft=True):
+    history = [message.model_dump() for message in request.history]
+    if user and request.conversation_id:
+        detail = get_conversation(settings.sqlite_path, user_id=int(user["id"]), conversation_id=request.conversation_id)
+        history = []
+        for message in detail["messages"][-8:]:
+            content = message.get("content") or ""
+            if message["role"] == "assistant":
+                content = json.dumps(message.get("answer") or {}, ensure_ascii=False)
+            history.append({"role": message["role"], "content": content[:2000]})
+    plan = plan_dialogue(request.question, history, base_url=settings.ollama_base_url,
+                        model=settings.ollama_generation_model, private=request.use_private_knowledge, draft=draft)
+    plan["history"] = history
+    return plan
 
 
 @app.get("/api/health")
@@ -1188,9 +1244,12 @@ def answer(request: SearchRequest, http_request: Request) -> dict[str, object]:
         except ConversationPermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
     try:
-        scope = resolve_scope(request.question, request.scope)
+        plan = _dialogue_plan(request, user)
+        if plan["mode"] == "general":
+            return _greeting_payload(request, http_request, user, plan["reply"])
+        scope = resolve_scope(plan["query"], request.scope)
         retrieval = search_knowledge(
-            request.question,
+            plan["query"],
             db_path=settings.sqlite_path,
             index_path=settings.lancedb_path,
             ollama_base_url=settings.ollama_base_url,
@@ -1201,7 +1260,7 @@ def answer(request: SearchRequest, http_request: Request) -> dict[str, object]:
             include_private=bool(request.use_private_knowledge and user and user["role"] == "user"),
         )
         generated = generate_answer(
-            request.question,
+            plan["query"],
             retrieval,
             base_url=settings.ollama_base_url,
             model=settings.ollama_generation_model,
@@ -1253,9 +1312,36 @@ def answer_stream(request: SearchRequest, http_request: Request) -> StreamingRes
         except ConversationPermissionError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
     try:
-        scope = resolve_scope(request.question, request.scope)
+        plan = _dialogue_plan(request, user, draft=False)
+    except GenerationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if plan["mode"] == "general":
+        def greeting_events():
+            yield _sse("progress", {"stage": "understanding", "label": "已理解问题，正在整理回答"})
+            parts = []
+            try:
+                for text in stream_ollama_chat(
+                    general_messages(request.question, plan["history"]), settings.ollama_base_url,
+                    settings.ollama_generation_model, json_mode=False,
+                ):
+                    parts.append(text)
+                    yield _sse("answer_delta", {"text": text})
+            except GenerationError as exc:
+                yield _sse("error", {"message": str(exc)})
+                return
+            payload = _greeting_payload(request, http_request, user, "".join(parts))
+            yield _sse("final", payload)
+            yield _sse("done", {"saved": payload["saved"], "conversation_id": payload["conversation_id"]})
+
+        return StreamingResponse(
+            greeting_events(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+    try:
+        scope = resolve_scope(plan["query"], request.scope)
         retrieval = search_knowledge(
-            request.question,
+            plan["query"],
             db_path=settings.sqlite_path,
             index_path=settings.lancedb_path,
             ollama_base_url=settings.ollama_base_url,
@@ -1269,7 +1355,9 @@ def answer_stream(request: SearchRequest, http_request: Request) -> StreamingRes
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     def events():
+        yield _sse("progress", {"stage": "retrieving", "label": "正在检索学校官方资料"})
         if not has_reliable_evidence(retrieval):
+            yield _sse("progress", {"stage": "checking", "label": "正在核对资料适用范围"})
             result = structure_answer("", retrieval)
             sources: list[dict[str, object]] = []
             saved, saved_conversation_id = _save_answer_if_logged_in(
@@ -1296,17 +1384,39 @@ def answer_stream(request: SearchRequest, http_request: Request) -> StreamingRes
             return
 
         reliable_hits = reliable_evidence_hits(retrieval)
+        yield _sse("progress", {"stage": "checking", "label": "已找到资料，正在核对证据"})
         raw_parts: list[str] = []
         try:
-            for delta in stream_ollama_chat(
-                _build_prompt(request.question, reliable_hits),
-                settings.ollama_base_url,
-                settings.ollama_generation_model,
-                timeout=240.0,
-            ):
-                raw_parts.append(delta)
-                yield _sse("delta", {"text": delta})
-            result = structure_answer("".join(raw_parts), retrieval)
+            yield _sse("progress", {"stage": "answering", "label": "正在组织回答"})
+            try:
+                for delta in stream_ollama_chat(
+                    _build_prompt(plan["query"], reliable_hits),
+                    settings.ollama_base_url,
+                    settings.ollama_generation_model,
+                    timeout=240.0,
+                ):
+                    raw_parts.append(delta)
+                    yield _sse("delta", {"text": delta})
+            except GenerationError as stream_error:
+                # 流式接口可能在 JSON 闭合前达到 num_predict 上限，或中途断开。
+                # 此时复用非流式接口的严格/精简重试，不把内部截断原因直接展示给用户。
+                try:
+                    result = generate_answer(
+                        plan["query"],
+                        retrieval,
+                        base_url=settings.ollama_base_url,
+                        model=settings.ollama_generation_model,
+                    )
+                except GenerationError as fallback_error:
+                    raise stream_error from fallback_error
+            else:
+                result = finalize_stream_answer(
+                    plan["query"],
+                    "".join(raw_parts),
+                    retrieval,
+                    base_url=settings.ollama_base_url,
+                    model=settings.ollama_generation_model,
+                )
             sources = _sources_for_ranks(retrieval, result["used_source_ranks"])
             saved, saved_conversation_id = _save_answer_if_logged_in(
                 http_request,

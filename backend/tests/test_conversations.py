@@ -169,6 +169,11 @@ class AnswerPersistenceTests(unittest.TestCase):
                     }
                 )
 
+            planner = patch.object(main_module, "_dialogue_plan", side_effect=lambda request, user: {
+                "mode": "general" if request.question == "你好" else "school",
+                "query": request.question, "reply": "你好，有什么可以帮你？",
+            })
+            planner.start()
             try:
                 with patch.object(main_module, "search_knowledge", return_value=retrieval), patch.object(
                     main_module, "generate_answer", return_value=generated
@@ -183,6 +188,17 @@ class AnswerPersistenceTests(unittest.TestCase):
                     )
                 self.assertTrue(logged_result["saved"])
                 self.assertFalse(guest_result["saved"])
+                greeting = main_module.answer(
+                    main_module.SearchRequest(question="你好", conversation_id=logged_result["conversation_id"]),
+                    request_with_token(token),
+                )
+                self.assertTrue(greeting["saved"])
+                self.assertEqual(greeting["conversation_id"], logged_result["conversation_id"])
+                self.assertEqual(greeting["sources"], [])
+                guest_greeting = main_module.answer(
+                    main_module.SearchRequest(question="你好"), request_with_token(None),
+                )
+                self.assertFalse(guest_greeting["saved"])
                 connection = sqlite3.connect(database)
                 try:
                     self.assertEqual(
@@ -190,11 +206,12 @@ class AnswerPersistenceTests(unittest.TestCase):
                         1,
                     )
                     self.assertEqual(
-                        connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 2
+                        connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0], 4
                     )
                 finally:
                     connection.close()
             finally:
+                planner.stop()
                 main_module.settings = previous_settings
 
 

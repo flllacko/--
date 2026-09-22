@@ -56,6 +56,12 @@ QUERY_ALIASES = (
     ("生源信息确认", "生源信息"),
     ("院系和专业方向", "院系专业"),
     ("补偿或贷款代偿", "补偿代偿"),
+    ("介绍一下学校", "学校简介"),
+    ("介绍学校", "学校简介"),
+    ("学校介绍", "学校简介"),
+    ("学校概况", "学校简介"),
+    ("学院简介", "学校简介"),
+    ("学校历史", "校史"),
 )
 
 
@@ -186,6 +192,11 @@ def _anchor_query_terms(question: str) -> tuple[str, ...]:
 
     normalized = _normalized_question(question)
     anchors: list[str] = []
+    if any(
+        marker in normalized
+        for marker in ("介绍一下学校", "介绍学校", "学校介绍", "学校概况", "学院简介", "学校历史")
+    ):
+        anchors.extend(("学校简介", "校史", "办学"))
     if "专升本" in normalized and "专科专业" in normalized:
         anchors.extend(("本专科专业对应指导目录", "专业对应", "考试科目"))
     if "专升本" in normalized and "对应目录" in normalized:
@@ -241,6 +252,11 @@ def _core_query_terms(question: str) -> list[str]:
 
     normalized = _normalized_question(question)
     terms: set[str] = set()
+    if any(
+        marker in normalized
+        for marker in ("介绍一下学校", "介绍学校", "学校介绍", "学校概况", "学院简介", "学校历史")
+    ):
+        terms.update(("学校简介", "校史", "办学"))
     for match in re.finditer(r"[a-z0-9]+|[\u4e00-\u9fff]+", normalized):
         value = match.group(0)
         if re.fullmatch(r"[a-z0-9]+", value):

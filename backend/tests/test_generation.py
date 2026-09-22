@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from app.qa.generation import _build_prompt, generate_answer
+from app.qa.generation import _build_prompt, finalize_stream_answer, generate_answer
 
 
 def _retrieval(distance: float | None, match_types: list[str], text: str = "国家助学金分为三档") -> dict[str, object]:
@@ -139,6 +139,26 @@ class GenerationTest(unittest.TestCase):
         )
         self.assertEqual(result["answer_status"], "completed")
         self.assertEqual(calls, 3)
+
+    def test_truncated_stream_uses_non_stream_repair(self) -> None:
+        calls = 0
+
+        def fake_chat(messages, base_url, model, timeout):
+            nonlocal calls
+            calls += 1
+            return '{"conclusion":"复学需要提交复学申请表。","conditions":[],"materials":["复学申请表"],"steps":[],"time":"","notes":[],"follow_up_questions":[],"source_ranks":[1]}'
+
+        result = finalize_stream_answer(
+            "休学、复学需要准备什么材料？",
+            '{"conclusion":"复学需要提交',
+            _retrieval(0.5, ["semantic", "keyword"], text="复学申请表"),
+            base_url="http://unused",
+            model="qwen3.5:9b",
+            chat_caller=fake_chat,
+        )
+        self.assertEqual(result["answer_status"], "completed")
+        self.assertEqual(result["answer"]["materials"], ["复学申请表"])
+        self.assertEqual(calls, 1)
 
 
 if __name__ == "__main__":

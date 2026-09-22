@@ -103,6 +103,17 @@ type GuestEntry = {
   sources: SearchHit[];
 };
 
+type ChatTurn = {
+  draft?: string;
+  draftAnswer?: AnswerBody;
+  id: string;
+  question: string;
+  progress: string[];
+  status: 'processing' | 'completed' | 'error';
+  answer: AnswerResponse | null;
+  error?: string;
+};
+
 type ConversationDetail = {
   id: number;
   title: string;
@@ -203,11 +214,104 @@ function loadGuestEntries(): GuestEntry[] {
   }
 }
 
-const examples = [
+const EXAMPLE_ROTATION_KEY = 'cdutetc_example_rotation_v1';
+const ACTIVE_GUEST_KEY = 'cdutetc_active_guest_v1';
+
+function readPartialString(raw: string, start: number): { text: string; end: number; closed: boolean } {
+  let escaped = false;
+  let end = start;
+  for (; end < raw.length; end++) {
+    if (!escaped && raw[end] === '"') break;
+    if (!escaped && raw[end] === '\\') escaped = true;
+    else escaped = false;
+  }
+  let part = raw.slice(start, end);
+  // 网络包可能切在转义字符或 Unicode 转义中间，等待后续字符。
+  for (let trim = 0; trim <= Math.min(6, part.length); trim++) {
+    try { return { text: JSON.parse('"' + part.slice(0, part.length - trim) + '"') as string, end, closed: raw[end] === '"' }; } catch { /* 等待完整转义 */ }
+  }
+  return { text: '', end, closed: false };
+}
+
+function partialAnswer(raw: string): AnswerBody {
+  const answer: AnswerBody = { conclusion: '', conditions: [], materials: [], steps: [], time: '', notes: [], follow_up_questions: [] };
+  for (const field of ['conclusion', 'time'] as const) {
+    const match = new RegExp('"' + field + '"\\s*:\\s*"').exec(raw);
+    if (match) answer[field] = readPartialString(raw, match.index + match[0].length).text;
+  }
+  for (const field of ['conditions', 'materials', 'steps', 'notes', 'follow_up_questions'] as const) {
+    const match = new RegExp('"' + field + '"\\s*:\\s*\\[').exec(raw);
+    if (!match) continue;
+    let pos = match.index + match[0].length;
+    while (pos < raw.length) {
+      while (/\s|,/.test(raw[pos] || '') && pos < raw.length) pos++;
+      if (raw[pos] !== '"') break;
+      const item = readPartialString(raw, pos + 1);
+      if (item.text) answer[field].push(item.text);
+      if (!item.closed) break;
+      pos = item.end + 1;
+    }
+  }
+  return answer;
+}
+
+function loadActiveGuestTurns(): ChatTurn[] {
+  try {
+    const raw = sessionStorage.getItem(ACTIVE_GUEST_KEY);
+    const entries = raw === null ? loadGuestEntries() : JSON.parse(raw);
+    return Array.isArray(entries) ? entries.map(guestEntryToChatTurn) : [];
+  } catch { return []; }
+}
+
+const examplePool = [
   '国家助学金有哪几个档次？',
   '休学、复学需要准备什么材料？',
   '新生宿舍和校园生活有哪些规定？',
+  '介绍一下学校',
+  '毕业生就业信息从哪里查看？',
+  '转专业一般需要满足什么条件？',
+  '学生医保报销需要准备什么？',
+  '寝室使用明火有什么规定？',
+  '专升本报名和缴费什么时候进行？',
 ];
+
+let pageExampleSelection: string[] | null = null;
+
+function getRotatedExamples(): string[] {
+  try {
+    if (pageExampleSelection) return pageExampleSelection;
+    const previous = JSON.parse(sessionStorage.getItem(EXAMPLE_ROTATION_KEY) || '[]');
+    const candidates = examplePool.filter(item => !Array.isArray(previous) || !previous.includes(item));
+    for (let i = candidates.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+    }
+    const selected = candidates.slice(0, 3);
+    sessionStorage.setItem(EXAMPLE_ROTATION_KEY, JSON.stringify(selected));
+    pageExampleSelection = selected;
+    return pageExampleSelection;
+  } catch {
+    pageExampleSelection = pageExampleSelection ?? examplePool.slice(0, 3);
+    return pageExampleSelection;
+  }
+}
+
+function guestEntryToChatTurn(entry: GuestEntry, index: number): ChatTurn {
+  return {
+    id: `guest-${index}-${entry.question}`,
+    question: entry.question,
+    progress: ['已检索并整理回答'],
+    status: 'completed',
+    answer: {
+      answer_status: entry.answer_status,
+      answer: entry.answer,
+      sources: entry.sources,
+      retrieval: { hit_count: entry.sources.length },
+      saved: false,
+      conversation_id: null,
+    },
+  };
+}
 
 function readPath(): string {
   return window.location.pathname || '/chat';
@@ -227,7 +331,19 @@ function App() {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [activeConversationId, setActiveConversationId] = useState<number | null>(null);
   const [guestEntries, setGuestEntries] = useState<GuestEntry[]>(loadGuestEntries);
+  const [chatTurns, setChatTurns] = useState<ChatTurn[]>(loadActiveGuestTurns);
+  const [examplePrompts] = useState<string[]>(getRotatedExamples);
   const abortControllerRef = useRef<AbortController | null>(null);
+  useEffect(() => {
+    if (user) return;
+    const entries = chatTurns.filter(turn => turn.status === 'completed' && turn.answer).map(turn => ({
+      question: turn.question,
+      answer: turn.answer!.answer,
+      answer_status: turn.answer!.answer_status,
+      sources: turn.answer!.sources,
+    }));
+    try { sessionStorage.setItem(ACTIVE_GUEST_KEY, JSON.stringify(entries)); } catch { /* 当前页面仍可继续聊天。 */ }
+  }, [chatTurns, user]);
 
   useEffect(() => {
     const onPopState = () => setPath(readPath());
@@ -326,6 +442,7 @@ function App() {
       setUsePrivateKnowledge(false);
       setConversations([]);
       setActiveConversationId(null);
+      setChatTurns([]);
       setAnswerResult(null);
       setNotice('已退出登录；访客仍可继续提问。');
       navigate('/chat');
@@ -340,6 +457,7 @@ function App() {
     setUsePrivateKnowledge(false);
     setConversations([]);
     setActiveConversationId(null);
+    setChatTurns([]);
     setAnswerResult(null);
     setNotice('账号、历史会话和私人资料已删除。');
     navigate('/chat');
@@ -348,23 +466,35 @@ function App() {
   const selectConversation = async (conversationId: number): Promise<void> => {
     try {
       const detail = await apiJson<ConversationDetail>(`/api/conversations/${conversationId}`);
-      const assistantIndex = [...detail.messages].reverse().findIndex((message) => message.role === 'assistant');
-      const realAssistantIndex = assistantIndex < 0 ? -1 : detail.messages.length - 1 - assistantIndex;
-      const assistant = realAssistantIndex >= 0 ? detail.messages[realAssistantIndex] : null;
-      const questionMessage = realAssistantIndex >= 0
-        ? [...detail.messages.slice(0, realAssistantIndex)].reverse().find((message) => message.role === 'user')
-        : detail.messages.find((message) => message.role === 'user');
-      if (assistant?.answer) {
-        setAnswerResult({
-          answer_status: assistant.answer.answer_status || 'completed',
-          answer: assistant.answer,
-          sources: assistant.sources || [],
-          retrieval: { hit_count: assistant.sources?.length || 0 },
-          saved: true,
-          conversation_id: conversationId,
-        });
-        setQuestion(questionMessage?.content || '');
-      }
+      const restoredTurns: ChatTurn[] = [];
+      detail.messages.forEach((message) => {
+        if (message.role === 'user') {
+          restoredTurns.push({
+            id: `history-${message.id}`,
+            question: message.content,
+            progress: ['已从历史会话加载'],
+            status: 'completed',
+            answer: null,
+          });
+          return;
+        }
+        const current = restoredTurns[restoredTurns.length - 1];
+        if (current && message.answer) {
+          const sources = message.sources || [];
+          current.answer = {
+            answer_status: message.answer.answer_status || 'completed',
+            answer: message.answer,
+            sources,
+            retrieval: { hit_count: sources.length },
+            saved: true,
+            conversation_id: conversationId,
+          };
+        }
+      });
+      setChatTurns(restoredTurns);
+      const latestAnswer = [...restoredTurns].reverse().find((turn) => turn.answer)?.answer || null;
+      setAnswerResult(latestAnswer);
+      setQuestion('');
       setIdentity(detail.identity);
       setUsePrivateKnowledge(false);
       setActiveConversationId(conversationId);
@@ -375,9 +505,11 @@ function App() {
   };
 
   const startNewConversation = (): void => {
+    if (isSearching) return;
     setActiveConversationId(null);
     setUsePrivateKnowledge(false);
     setQuestion('');
+    setChatTurns([]);
     setAnswerResult(null);
     setStreamPreview('');
     setNotice('已开始新的空白会话。');
@@ -437,11 +569,23 @@ function App() {
 
   const submitQuestion = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
-    if (!question.trim()) return;
+    if (!question.trim() || isSearching) return;
     const submittedQuestion = question.trim();
+    const turnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setChatTurns((current) => [
+      ...current,
+      {
+        id: turnId,
+        question: submittedQuestion,
+        progress: ['已收到问题'],
+        status: 'processing',
+        answer: null,
+      },
+    ]);
+    setQuestion('');
     setIsSearching(true);
     setAnswerResult(null);
-    setNotice('正在检索当前有效的官方资料……');
+    setNotice('');
     try {
       const controller = new AbortController();
       abortControllerRef.current = controller;
@@ -451,6 +595,10 @@ function App() {
         credentials: 'include',
         body: JSON.stringify({
           question: submittedQuestion,
+          history: chatTurns.filter(turn => turn.status === 'completed' && turn.answer).slice(-4).flatMap(turn => [
+            { role: 'user', content: turn.question.slice(0, 2000) },
+            { role: 'assistant', content: JSON.stringify(turn.answer!.answer).slice(0, 2000) },
+          ]),
           scope: 'current',
           limit: 6,
           identity,
@@ -467,13 +615,24 @@ function App() {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
+      let rawAnswer = '';
       const finalResult: { value: AnswerResponse | null } = { value: null };
       const handleEvent = (block: string): void => {
         const eventName = block.split('\n').find((line) => line.startsWith('event:'))?.slice(6).trim();
         const dataLine = block.split('\n').find((line) => line.startsWith('data:'))?.slice(5).trim();
         if (!eventName || !dataLine) return;
-        const data = JSON.parse(dataLine) as { text?: string; message?: string } & Partial<AnswerResponse>;
-        if (eventName === 'delta' && data.text) {
+        const data = JSON.parse(dataLine) as { text?: string; message?: string; label?: string } & Partial<AnswerResponse>;
+        if (eventName === 'progress' && data.label) {
+          setChatTurns((current) => current.map((turn) => turn.id === turnId
+            ? { ...turn, progress: turn.progress.includes(data.label as string) ? turn.progress : [...turn.progress, data.label as string] }
+            : turn));
+        } else if (eventName === 'answer_delta' && data.text) {
+          setChatTurns(current => current.map(turn => turn.id === turnId
+            ? { ...turn, draft: (turn.draft || '') + data.text } : turn));
+        } else if (eventName === 'delta' && data.text) {
+          rawAnswer += data.text;
+          const draftAnswer = partialAnswer(rawAnswer);
+          setChatTurns(current => current.map(turn => turn.id === turnId ? { ...turn, draft: draftAnswer.conclusion, draftAnswer } : turn));
           setStreamPreview((current) => current + data.text);
         } else if (eventName === 'final') {
           finalResult.value = data as AnswerResponse;
@@ -489,10 +648,15 @@ function App() {
         blocks.forEach(handleEvent);
         if (done) break;
       }
+      if (buffer.trim()) handleEvent(buffer);
+      if (!finalResult.value) throw new Error('回答连接已结束，但未收到完整回答，请重新发送问题。');
       if (finalResult.value) {
         const result = finalResult.value;
         setAnswerResult(result);
         setStreamPreview('');
+        setChatTurns((current) => current.map((turn) => turn.id === turnId
+          ? { ...turn, status: 'completed', answer: result, progress: [...turn.progress, '回答已完成'] }
+          : turn));
         if (!user) {
           setGuestEntries((current) => [
             ...current,
@@ -507,18 +671,22 @@ function App() {
           setActiveConversationId(result.conversation_id);
           void loadConversations(user);
         }
-        const baseNotice = result.answer_status === 'completed'
-          ? `已根据 ${result.sources.length} 条实际资料生成回答。`
-          : '当前没有足够可靠的官方依据，系统没有编造答案。';
-        setNotice(user && result.saved ? `${baseNotice} 已保存到历史会话。` : baseNotice);
+        setNotice('');
       }
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') {
         setStreamPreview('');
+        setChatTurns((current) => current.map((turn) => turn.id === turnId
+          ? { ...turn, status: 'error', error: '已停止生成；本次未保存未完成回答。', progress: [...turn.progress, '回答已停止'] }
+          : turn));
         setNotice('已停止生成；本次未保存未完成回答。');
       } else {
         setStreamPreview('');
-        setNotice(error instanceof Error ? error.message : '检索失败，请确认后端和 Ollama 已启动。');
+        const errorMessage = error instanceof Error ? error.message : '检索失败，请确认后端和 Ollama 已启动。';
+        setChatTurns((current) => current.map((turn) => turn.id === turnId
+          ? { ...turn, status: 'error', error: errorMessage, progress: [...turn.progress, '回答未完成'] }
+          : turn));
+        setNotice(errorMessage);
       }
     } finally {
       abortControllerRef.current = null;
@@ -557,8 +725,10 @@ function App() {
             setQuestion={setQuestion}
             submitQuestion={submitQuestion}
             selectExample={selectExample}
+            examplePrompts={examplePrompts}
             notice={notice}
             answerResult={answerResult}
+            chatTurns={chatTurns}
             isSearching={isSearching}
             streamPreview={streamPreview}
             stopAnswer={stopAnswer}
@@ -758,8 +928,10 @@ type ChatPageProps = {
   setQuestion: Dispatch<SetStateAction<string>>;
   submitQuestion: (event: FormEvent<HTMLFormElement>) => void;
   selectExample: (example: string) => void;
+  examplePrompts: string[];
   notice: string;
   answerResult: AnswerResponse | null;
+  chatTurns: ChatTurn[];
   isSearching: boolean;
   streamPreview: string;
   stopAnswer: () => void;
@@ -787,8 +959,10 @@ function ChatPage({
   setQuestion,
   submitQuestion,
   selectExample,
+  examplePrompts,
   notice,
   answerResult,
+  chatTurns,
   isSearching,
   streamPreview,
   stopAnswer,
@@ -808,40 +982,84 @@ function ChatPage({
   onBatchDelete,
 }: ChatPageProps) {
   const selectedIdentity = identities.find((item) => item.key === identity);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const scrollArea = useRef<HTMLDivElement>(null);
+  const followLatest = useRef(true);
+  const previousTurnCount = useRef(0);
+  useEffect(() => {
+    const area = scrollArea.current;
+    if (area && (followLatest.current || chatTurns.length !== previousTurnCount.current)) {
+      area.scrollTop = area.scrollHeight;
+    }
+    previousTurnCount.current = chatTurns.length;
+  }, [chatTurns]);
+  const [suggestions, setSuggestions] = useState(examplePrompts);
+  const refreshSuggestions = () => {
+    pageExampleSelection = null;
+    setSuggestions(getRotatedExamples());
+  };
+  const newChat = () => {
+    onNewConversation();
+    refreshSuggestions();
+    setHistoryOpen(false);
+  };
 
   return (
     <div className="page chat-page">
       <TopBar identity={identity} setIdentity={setIdentity} user={user} navigate={navigate} />
+      <div className="chat-toolbar">
+        <button type="button" disabled={isSearching} onClick={newChat}>＋ 新建会话</button>
+        <button type="button" disabled={isSearching} aria-expanded={historyOpen} onClick={() => setHistoryOpen(!historyOpen)}>历史会话 {historyOpen ? '⌃' : '⌄'}</button>
+      </div>
       <div className="chat-workspace">
+        {historyOpen && <div className="history-popover">
         <HistoryPanel
           user={user}
           conversations={conversations}
           guestEntries={guestEntries}
           activeConversationId={activeConversationId}
-          onNewConversation={onNewConversation}
-          onSelectConversation={onSelectConversation}
+          onNewConversation={newChat}
+          onSelectConversation={(id) => { onSelectConversation(id); setHistoryOpen(false); }}
           onRenameConversation={onRenameConversation}
           onTogglePin={onTogglePin}
           onDeleteConversation={onDeleteConversation}
           onBatchDelete={onBatchDelete}
         />
+        </div>}
         <section className="chat-content">
-        <div className="welcome-orbit" aria-hidden="true"><span>问</span></div>
-        <div className="welcome-copy">
-          <div className="eyebrow">欢迎使用</div>
-          <h2>你想了解学校的什么信息？</h2>
-          <p>我会优先检索学校公开资料，并在回答中标出实际使用的来源。</p>
+        <div className="chat-scroll-area" ref={scrollArea} onScroll={(event) => {
+          const area = event.currentTarget;
+          followLatest.current = area.scrollHeight - area.scrollTop - area.clientHeight < 100;
+        }}>
+        {chatTurns.length === 0 ? (
+          <>
+            <div className="welcome-orbit" aria-hidden="true"><span>问</span></div>
+            <div className="welcome-copy">
+              <div className="eyebrow">欢迎使用</div>
+              <h2>你想了解学校的什么信息？</h2>
+              <p>我会先理解问题，再检索官方资料、核对证据并整理回答。</p>
+            </div>
+
+            <div className="example-grid" aria-label="问题示例">
+              {suggestions.map((example) => (
+                <button className="example-card" type="button" key={example} onClick={() => selectExample(example)}>
+                  <span className="example-arrow">↗</span>
+                  <span>{example}</span>
+                </button>
+              ))}
+            </div>
+            <button type="button" className="refresh-suggestions" onClick={refreshSuggestions}>↻ 换一换</button>
+          </>
+        ) : (
+          <div className="chat-thread" aria-live="polite">
+            {chatTurns.map((turn) => (
+              <ChatTurnView key={turn.id} turn={turn} onFollowUp={selectFollowUp} />
+            ))}
+          </div>
+        )}
         </div>
 
-        <div className="example-grid" aria-label="问题示例">
-          {examples.map((example) => (
-            <button className="example-card" type="button" key={example} onClick={() => selectExample(example)}>
-              <span className="example-arrow">↗</span>
-              <span>{example}</span>
-            </button>
-          ))}
-        </div>
-
+        <div className="composer-dock">
         <form className="composer" onSubmit={submitQuestion}>
           <textarea
             value={question}
@@ -849,6 +1067,12 @@ function ChatPage({
             placeholder="输入你想了解的问题，例如：休学需要哪些材料？"
             rows={2}
             aria-label="输入问题"
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                if (!isSearching && question.trim()) event.currentTarget.form?.requestSubmit();
+              }
+            }}
           />
           <div className="composer-footer">
             <div className="composer-options">
@@ -867,43 +1091,99 @@ function ChatPage({
             {isSearching ? (
               <button className="stop-button" type="button" onClick={stopAnswer}>停止</button>
             ) : (
-              <button className="send-button" type="submit" aria-label="提交问题">↑</button>
+              <button className="send-button" type="submit" aria-label="提交问题" disabled={!question.trim()}>↑</button>
             )}
           </div>
         </form>
 
-        {notice && <div className="honest-notice" role="status">{notice}</div>}
-        {streamPreview && <div className="stream-preview" aria-live="polite">正在组织回答：{streamPreview}</div>}
-        {answerResult && <AnswerPanel result={answerResult} onFollowUp={selectFollowUp} />}
-        {answerResult && answerResult.sources.length > 0 && (
-          <section className="evidence-panel" aria-label="检索到的资料依据">
-            <div className="evidence-heading">
-              <div>
-                <div className="eyebrow">检索依据</div>
-                <h3>当前有效的官方资料片段</h3>
-              </div>
-              <span className="evidence-count">{answerResult.sources.length} 条</span>
-            </div>
-            <div className="evidence-list">
-              {answerResult.sources.map((hit) => (
-                <article className="evidence-card" key={`${hit.document_id}-${hit.chunk_index}`}>
-                  <div className="evidence-meta"><span>{hit.module}</span><span>{hit.content_status}</span></div>
-                  <h4>{hit.title}</h4>
-                  <p>{hit.text}</p>
-                  <div className="evidence-source">
-                    <span>{hit.source_label || '官方来源'}</span>
-                    {hit.published_date && <span>{hit.published_date}</span>}
-                    {hit.source_url && <a href={hit.source_url} target="_blank" rel="noreferrer">查看原文 ↗</a>}
-                  </div>
-                </article>
-              ))}
-            </div>
-          </section>
-        )}
-        <p className="privacy-note">当前为本地优先工程。没有可靠公开依据的问题，正式版本会明确提示“暂未找到可靠资料”，不会编造答案。</p>
+        {notice && (chatTurns.length === 0 || notice.includes('失败') || notice.includes('停止')) && <div className="honest-notice" role="status">{notice}</div>}
+        <p className="privacy-note">Enter 发送 · Shift + Enter 换行 · 具体办理要求请核对引用的官方资料</p>
+        </div>
         </section>
       </div>
     </div>
+  );
+}
+
+function ChatTurnView({ turn, onFollowUp }: { turn: ChatTurn; onFollowUp: (question: string) => void }) {
+  return (
+    <article className="chat-turn">
+      <div className="message-bubble user-message">
+        <div className="message-role">你</div>
+        <p>{turn.question}</p>
+      </div>
+      <div className="assistant-message">
+        <div className="assistant-heading">
+          <span className="assistant-avatar">问</span>
+          <div><strong>学生服务问答助手</strong><small>本地资料优先</small></div>
+        </div>
+        {turn.status === 'processing' && !turn.draft && !turn.draftAnswer && <p className="reply-status" role="status">正在准备回答…</p>}
+        {turn.error && <div className="chat-error" role="alert">{turn.error}</div>}
+        {(turn.draft || turn.draftAnswer || turn.answer) && <AnswerPanel result={turn.answer} draft={turn.draft} draftAnswer={turn.draftAnswer} onFollowUp={onFollowUp} />}
+        {turn.answer && <EvidenceDisclosure sources={turn.answer.sources} />}
+      </div>
+    </article>
+  );
+}
+
+const HIDDEN_EVIDENCE_SECTIONS = [
+  '资料信息', '可回答的问题', '能支撑的学生自然问法', '可回答的自然问法',
+  '可回答范围', '使用边界', '整理边界', '时效边界', '证据边界',
+  '资料用途', '已隔离或处理失败', '可作为问答候选',
+];
+
+function evidenceDisplayText(rawText: string): string {
+  const lines = rawText.replace(/\r\n/g, '\n').split('\n');
+  const visible: string[] = [];
+  let hiddenSection = false;
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd();
+    const section = /^##\s+(.+?)\s*$/.exec(line)?.[1];
+    if (section) {
+      hiddenSection = HIDDEN_EVIDENCE_SECTIONS.some((name) => section === name || section.startsWith(name));
+      if (!hiddenSection && !/正文|原文|核心条款|要点|摘录/.test(section)) visible.push(section);
+      continue;
+    }
+    if (hiddenSection || /^#\s+/.test(line)) continue;
+    if (/^[-*]\s*(资料编号|处理状态|内容状态|所属模块|资料类型|资料级别|来源文字|发布日期|时效状态|有效性初判|抓取日期|原文链接|检索别名|正文指纹|整理备注)[:：]/.test(line)) continue;
+    visible.push(line);
+  }
+  return visible
+    .join('\n')
+    .replace(/\[([^\]]+)]\([^\)]+\)/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/^[-*]\s+/gm, '• ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function EvidenceDisclosure({ sources }: { sources: SearchHit[] }) {
+  const [open, setOpen] = useState(false);
+  if (!sources.length) return null;
+  return (
+    <details
+      className="evidence-panel evidence-disclosure"
+      open={open}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary className="evidence-summary">
+        <span><span className="eyebrow">参考资料</span><strong>{sources.length} 条引用片段</strong></span>
+        <span className="evidence-summary-action">{open ? '收起原文片段⌃' : '展开原文片段⌄'}</span>
+      </summary>
+      <div className="evidence-list">
+        {sources.map((hit) => (
+          <article className="evidence-card" key={`${hit.document_id}-${hit.chunk_index}`}>
+            <h4>{hit.title}</h4>
+            <p>{evidenceDisplayText(hit.text) || '该片段没有可直接展示的正文，请通过原文链接核对。'}</p>
+            <div className="evidence-source">
+              <span>{hit.source_label || '官方来源'}</span>
+              {hit.published_date && <span>{hit.published_date}</span>}
+              {hit.source_url && <a href={hit.source_url} target="_blank" rel="noreferrer">查看原文 ↗</a>}
+            </div>
+          </article>
+        ))}
+      </div>
+    </details>
   );
 }
 
@@ -985,13 +1265,12 @@ function HistoryPanel({
   );
 }
 
-function AnswerPanel({ result, onFollowUp }: { result: AnswerResponse; onFollowUp: (question: string) => void }) {
-  const { answer } = result;
+function AnswerPanel({ result, draft, draftAnswer, onFollowUp }: { result: AnswerResponse | null; draft?: string; draftAnswer?: AnswerBody; onFollowUp: (question: string) => void }) {
+  const answer = result?.answer ?? draftAnswer;
   return (
-    <section className="answer-panel" aria-label="回答内容">
-      <div className="eyebrow">回答</div>
-      <h3>{result.answer_status === 'completed' ? '根据官方资料整理' : '暂未找到可靠资料'}</h3>
-      <p className="answer-conclusion">{answer.conclusion}</p>
+    <section className="answer-panel" aria-label={result ? '回答内容' : '正在生成回答'} aria-busy={!result}>
+      <p className="answer-conclusion" style={{ whiteSpace: 'pre-wrap' }}>{answer?.conclusion ?? draft}</p>
+      {answer && <>
       <AnswerList label="适用条件" items={answer.conditions} />
       <AnswerList label="所需材料" items={answer.materials} />
       <AnswerList label="办理流程" items={answer.steps} ordered />
@@ -1001,10 +1280,11 @@ function AnswerPanel({ result, onFollowUp }: { result: AnswerResponse; onFollowU
         <div className="follow-up-panel">
           <strong>需要补充</strong>
           <div>{answer.follow_up_questions.map((question) => (
-            <button type="button" key={question} onClick={() => onFollowUp(question)}>{question}</button>
+            <button type="button" key={question} disabled={!result} onClick={() => onFollowUp(question)}>{question}</button>
           ))}</div>
         </div>
       )}
+      </>}
     </section>
   );
 }

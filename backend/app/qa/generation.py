@@ -18,7 +18,7 @@ ANSWER_LIST_FIELDS = ("conditions", "materials", "steps", "notes")
 # 检索片段会占用较多上下文。Ollama 默认上下文可能只有约 4096 token，
 # 留给模型的输出会因此被截断；这里显式留出证据和完整 JSON 回答的空间。
 OLLAMA_CONTEXT_TOKENS = 8192
-OLLAMA_OUTPUT_TOKENS = 512
+OLLAMA_OUTPUT_TOKENS = 768
 
 
 def _call_ollama_chat(
@@ -26,6 +26,7 @@ def _call_ollama_chat(
     base_url: str,
     model: str,
     timeout: float = 240.0,
+    response_schema: dict | None = None,
 ) -> str:
     payload = json.dumps(
         {
@@ -33,7 +34,7 @@ def _call_ollama_chat(
             "messages": list(messages),
             "stream": False,
             "think": False,
-            "format": "json",
+            "format": response_schema or "json",
             "keep_alive": "5m",
             "options": {
                 "temperature": 0.1,
@@ -74,6 +75,7 @@ def stream_ollama_chat(
     base_url: str,
     model: str,
     timeout: float = 240.0,
+    json_mode: bool = True,
 ) -> Iterator[str]:
     """读取 Ollama NDJSON 流；只转发最终内容，不转发 thinking 字段。"""
 
@@ -83,7 +85,7 @@ def stream_ollama_chat(
             "messages": list(messages),
             "stream": True,
             "think": False,
-            "format": "json",
+            **({"format": "json"} if json_mode else {}),
             "keep_alive": "5m",
             "options": {
                 "temperature": 0.1,
@@ -205,7 +207,7 @@ def _reliable_hits(retrieval: dict[str, object]) -> list[dict[str, object]]:
         distance = hit.get("semantic_distance")
         semantic_ok = isinstance(distance, (float, int)) and float(distance) <= 0.82
         match_types = hit.get("match_types") or []
-        text = str(hit.get("text") or "")
+        text = f"{hit.get('text') or ''} {hit.get('title') or ''} {hit.get('source_label') or ''}"
         keyword_count = sum(1 for term in keyword_terms if isinstance(term, str) and len(term) >= 2 and term in text)
         long_keyword_count = sum(
             1
@@ -381,7 +383,7 @@ def _build_prompt(question: str, hits: Sequence[dict[str, object]]) -> list[dict
 {scope}
 {focus}
 如果证据不能支持某个字段，就把该字段写成空字符串或空数组，不要推断。回答只返回 JSON 对象，不要返回 Markdown、解释或思考过程。
-JSON 字段必须是：conclusion（结论字符串）、conditions（适用条件数组）、materials（办理者实际需要提交或准备的材料数组）、steps（办理步骤数组）、time（时间字符串）、notes（注意事项数组）、follow_up_questions（必要时的补充问题数组，最多两条）、source_ranks（实际使用的资料编号数组）。只有缺少年份、对象或事项范围且会改变答案时才填写 follow_up_questions；不必要时返回空数组。materials 只能写官方片段明确要求学生提交或准备的材料，不能把政策名称、网页标题或来源文件名当成办理材料；没有明确材料就返回空数组。steps 也只能写资料明确支持的步骤，不能凭常识补全。"""
+JSON 字段必须是：conclusion（结论字符串）、conditions（适用条件数组）、materials（办理者实际需要提交或准备的材料数组）、steps（办理步骤数组）、time（时间字符串）、notes（注意事项数组）、follow_up_questions（必要时的补充问题数组，最多两条）、source_ranks（实际使用的资料编号数组）。只有缺少年份、对象或事项范围且会改变答案时才填写 follow_up_questions；不必要时返回空数组。materials 只能写官方片段明确要求学生提交或准备的材料，不能把政策名称、网页标题或来源文件名当成办理材料；没有明确材料就返回空数组。steps 也只能写资料明确支持的步骤，不能凭常识补全。每个数组只列与当前问题直接相关的内容，不要把整段资料复述到 JSON 中。"""
     priority_evidence = _priority_evidence(question, hits)
     priority_block = ""
     if priority_evidence:
@@ -455,13 +457,17 @@ def structure_answer(raw_content: str, retrieval: dict[str, object]) -> dict[str
         return {
             "answer_status": "no_reliable_evidence",
             "answer": {
-                "conclusion": "暂未找到能够可靠支持这个问题的官方资料，暂时不能作出确定回答。",
+                "conclusion": (
+                    f"我检索了当前可用资料，但还没有找到足以回答“{str(retrieval.get('question') or '这个问题')[:180]}”的可靠依据。"
+                    + ("检索到的片段不足以确认所问的具体要求。" if retrieval.get("hits") else "本次没有检索到匹配的可用正文。")
+                    + "这不代表学校没有相关规定，只是目前知识库还不能确认。"
+                ),
                 "conditions": [],
                 "materials": [],
                 "steps": [],
                 "time": "",
-                "notes": ["请提供更具体的年份、事项或办理对象，或以学校最新通知为准。"],
-                "follow_up_questions": ["你想询问哪个学年、事项或办理对象？"],
+                "notes": ["如果你有相关通知链接或文件，可以补充给我继续核对；也可向负责该事项的学校部门确认。当前未进行联网搜索。"],
+                "follow_up_questions": [],
             },
             "used_source_ranks": [],
         }
@@ -476,3 +482,29 @@ def structure_answer(raw_content: str, retrieval: dict[str, object]) -> dict[str
         "answer": answer,
         "used_source_ranks": source_ranks,
     }
+
+
+def finalize_stream_answer(
+    question: str,
+    raw_content: str,
+    retrieval: dict[str, object],
+    *,
+    base_url: str,
+    model: str,
+    chat_caller: Callable[..., str] = _call_ollama_chat,
+) -> dict[str, object]:
+    """整理流式结果；JSON 被截断时复用非流式的严格重试链路。"""
+
+    try:
+        return structure_answer(raw_content, retrieval)
+    except GenerationError as stream_error:
+        try:
+            return generate_answer(
+                question,
+                retrieval,
+                base_url=base_url,
+                model=model,
+                chat_caller=chat_caller,
+            )
+        except GenerationError as fallback_error:
+            raise stream_error from fallback_error

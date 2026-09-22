@@ -7,6 +7,27 @@ from typing import Literal
 SearchScope = Literal["current", "historical", "navigation"]
 
 
+def is_greeting_query(question: str) -> bool:
+    """识别不需要查资料的简短寒暄，避免把问候误判为资料缺口。"""
+
+    normalized = re.sub(r"[\s，。！？!?、,.~～]+", "", question).strip().lower()
+    return normalized in {
+        "你好",
+        "您好",
+        "嗨",
+        "哈喽",
+        "hello",
+        "hi",
+        "hey",
+        "在吗",
+        "你在吗",
+        "谢谢",
+        "谢谢你",
+        "再见",
+        "拜拜",
+    }
+
+
 def _normalized(question: str) -> str:
     return re.sub(r"\s+", "", question).strip()
 
