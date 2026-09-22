@@ -31,3 +31,9 @@ class DialogueTests(unittest.TestCase):
         self.assertEqual(result['mode'], 'general')
         self.assertEqual(caller.call_count, 2)
         self.assertIn('enum', caller.call_args.kwargs['response_schema']['properties']['mode'])
+
+    def test_router_prompt_does_not_expand_unasked_details(self):
+        with patch('app.qa.dialogue._call_ollama_chat', return_value='{"mode":"school","query":"我想办理休学","reply":""}') as caller:
+            result = plan_dialogue('我想办休学', [], base_url='http://localhost', model='test')
+        self.assertEqual(result['query'], '我想办理休学')
+        self.assertIn('不能擅自增加用户没有询问的材料、流程、时间、条件或结论', caller.call_args.args[0][0]['content'])

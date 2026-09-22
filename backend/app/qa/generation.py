@@ -234,6 +234,99 @@ def has_reliable_evidence(retrieval: dict[str, object]) -> bool:
     return bool(_reliable_hits(retrieval))
 
 
+SERVICE_TOPICS = (
+    "休学",
+    "复学",
+    "退学",
+    "转专业",
+    "补考",
+    "缓考",
+    "学生证",
+    "国家助学金",
+    "奖学金",
+    "助学贷款",
+    "入学资格",
+    "专升本",
+    "调宿",
+    "住宿",
+    "就业手续",
+    "档案",
+)
+
+
+def _broad_service_topic(question: str) -> str:
+    """识别“我想办休学”这类只表达办事目标、尚未说明关注点的问题。"""
+
+    normalized = re.sub(r"\s+", "", question)
+    has_intent = any(
+        marker in normalized
+        for marker in (
+            "我想办",
+            "我想申请",
+            "我要办",
+            "我要申请",
+            "想办理",
+            "想申请",
+            "要办理",
+            "要申请",
+            "准备办理",
+            "准备申请",
+            "怎么办",
+        )
+    )
+    if not has_intent:
+        return ""
+    if any(
+        marker in normalized
+        for marker in (
+            "材料",
+            "条件",
+            "资格",
+            "流程",
+            "步骤",
+            "手续",
+            "时间",
+            "什么时候",
+            "多久",
+            "截止",
+            "地点",
+            "哪里",
+            "费用",
+            "金额",
+            "能不能",
+            "是否",
+        )
+    ):
+        return ""
+    return next((topic for topic in SERVICE_TOPICS if topic in normalized), "")
+
+
+def _guide_broad_service_intent(
+    question: str,
+    answer: dict[str, object],
+) -> dict[str, object]:
+    """给宽泛办事问题补上自然引导；事实字段仍完全来自模型和证据。"""
+
+    topic = _broad_service_topic(question)
+    if not topic:
+        return answer
+    guided = dict(answer)
+    guided["conclusion"] = (
+        f"可以，我来帮你核对{topic}办理。为了避免一次给你堆太多信息，"
+        "你想先了解申请条件、所需材料、办理流程，还是时间节点？"
+        "我会根据学校现有资料回答，资料没有明确写出的部分会直接说明。"
+    )
+    # 宽泛办事意图的按钮是界面操作，不承载政策事实。统一使用用户口吻，
+    # 避免小模型生成“您想了解……吗”这类点击后不自然的句子。
+    guided["follow_up_questions"] = [
+        f"{topic}需要满足哪些条件？",
+        f"{topic}需要准备哪些材料？",
+        f"{topic}的办理流程是什么？",
+        f"{topic}有哪些时间要求？",
+    ]
+    return guided
+
+
 def _prefer_specific_evidence(
     question: str,
     hits: Sequence[dict[str, object]],
@@ -358,7 +451,12 @@ def _priority_evidence(question: str, hits: Sequence[dict[str, object]]) -> str:
     return "\n".join(selected)
 
 
-def _build_prompt(question: str, hits: Sequence[dict[str, object]]) -> list[dict[str, str]]:
+def _build_prompt(
+    question: str,
+    hits: Sequence[dict[str, object]],
+    *,
+    original_question: str | None = None,
+) -> list[dict[str, str]]:
     hits = _prefer_specific_evidence(question, hits)
     evidence_parts: list[str] = []
     # 同一份长正文的多个切片放在一起，金额表、材料表、时间表不容易被
@@ -426,6 +524,14 @@ def _build_prompt(question: str, hits: Sequence[dict[str, object]]) -> list[dict
         focus_parts.append("报名缴费问题要区分普通考生统一网上报名与特定群体补报名；优先采用正文明确写出的统一报名缴费时间、报名考试费和日程安排表，不能用退役士兵补报名日期替代普通报名时间。")
     if "课程" in question and any(marker in question for marker in ("就业", "单位", "工作")):
         focus_parts.append("问题同时询问课程和就业方向。conclusion 必须分别列出资料明确的主要课程名称，以及资料明确提到的就业单位或就业方向；不能只写‘课程设置完善’或只回答其中一部分。")
+    broad_topic = _broad_service_topic(original_question or question)
+    if broad_topic:
+        focus_parts.append(
+            f"用户只表达了想办理{broad_topic}，尚未说明具体关注点。不要只用‘资料未提供’结束回答；"
+            f"conclusion 应先自然回应‘可以，我来帮你核对{broad_topic}办理’，然后主动询问用户想先了解申请条件、所需材料、办理流程还是时间节点。"
+            "本轮不要展开政策事实，不要罗列相邻制度中的退学、处分或其他用户没有询问的内容；用户选择方向后再详细回答。"
+            "follow_up_questions 写成用户点击后可以直接发送的简短问题，不要虚构资料没有写出的事实。"
+        )
     focus = " ".join(focus_parts)
     system = f"""你是成都理工大学工程技术学院学生服务问答助手。
 只能依据用户问题下面给出的官方资料片段回答，不能使用常识、模型记忆、搜索摘要或资料片段之外的信息。
@@ -467,7 +573,12 @@ def generate_answer(
     if not reliable_hits:
         return structure_answer("", retrieval)
 
-    messages = _build_prompt(question, reliable_hits)
+    original_question = str(retrieval.get("original_question") or question)
+    messages = _build_prompt(
+        question,
+        reliable_hits,
+        original_question=original_question,
+    )
     strict_messages = [dict(message) for message in messages]
     strict_messages[0]["content"] += (
         "\n上一轮输出未通过 JSON 校验。现在只返回一个完整、合法的 JSON 对象，"
@@ -476,7 +587,11 @@ def generate_answer(
     strict_messages[1]["content"] += (
         "\n请重新生成：必须从第一个字符开始输出 {，并在最后一个字符输出 }。"
     )
-    compact_messages = _build_prompt(question, reliable_hits[:3])
+    compact_messages = _build_prompt(
+        question,
+        reliable_hits[:3],
+        original_question=original_question,
+    )
     compact_messages[0]["content"] += (
         "\n这是最后一次格式修复。回答必须极简：conclusion 不超过 80 个字，"
         "每个数组最多 2 项，每项不超过 30 个字；没有明确依据的字段必须为空。"
@@ -505,9 +620,9 @@ def structure_answer(raw_content: str, retrieval: dict[str, object]) -> dict[str
 
     reliable_hits = reliable_evidence_hits(retrieval)
     if not reliable_hits:
-        return {
-            "answer_status": "no_reliable_evidence",
-            "answer": {
+        answer = _guide_broad_service_intent(
+            str(retrieval.get("original_question") or retrieval.get("question") or ""),
+            {
                 "conclusion": (
                     f"我检索了当前可用资料，但还没有找到足以回答“{str(retrieval.get('question') or '这个问题')[:180]}”的可靠依据。"
                     + ("检索到的片段不足以确认所问的具体要求。" if retrieval.get("hits") else "本次没有检索到匹配的可用正文。")
@@ -520,13 +635,29 @@ def structure_answer(raw_content: str, retrieval: dict[str, object]) -> dict[str
                 "notes": ["如果你有相关通知链接或文件，可以补充给我继续核对；也可向负责该事项的学校部门确认。当前未进行联网搜索。"],
                 "follow_up_questions": [],
             },
+        )
+        return {
+            "answer_status": "no_reliable_evidence",
+            "answer": answer,
             "used_source_ranks": [],
         }
     answer, source_ranks = _structured_answer(
         _parse_json_object(raw_content),
         len(retrieval.get("hits", [])),
     )
-    if not source_ranks:
+    original_question = str(
+        retrieval.get("original_question") or retrieval.get("question") or ""
+    )
+    answer = _guide_broad_service_intent(
+        original_question,
+        answer,
+    )
+    broad_topic = _broad_service_topic(original_question)
+    if broad_topic:
+        # 本轮只做意图澄清，没有向用户陈述资料事实，因此不展示容易误导的
+        # 片段；用户选择具体方向后，下一轮再绑定实际使用的来源。
+        source_ranks = []
+    elif not source_ranks:
         source_ranks = [int(hit["rank"]) for hit in reliable_hits]
     return {
         "answer_status": "completed",

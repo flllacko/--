@@ -1260,6 +1260,7 @@ def answer(request: SearchRequest, http_request: Request) -> dict[str, object]:
             owner_user_id=int(user["id"]) if request.use_private_knowledge and user and user["role"] == "user" else None,
             include_private=bool(request.use_private_knowledge and user and user["role"] == "user"),
         )
+        retrieval["original_question"] = request.question.strip()
         generated = generate_answer(
             plan["query"],
             retrieval,
@@ -1352,6 +1353,7 @@ def answer_stream(request: SearchRequest, http_request: Request) -> StreamingRes
             owner_user_id=int(user["id"]) if request.use_private_knowledge and user and user["role"] == "user" else None,
             include_private=bool(request.use_private_knowledge and user and user["role"] == "user"),
         )
+        retrieval["original_question"] = request.question.strip()
     except (ValueError, RetrievalError) as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -1391,7 +1393,11 @@ def answer_stream(request: SearchRequest, http_request: Request) -> StreamingRes
             yield _sse("progress", {"stage": "answering", "label": "正在组织回答"})
             try:
                 for delta in stream_ollama_chat(
-                    _build_prompt(plan["query"], reliable_hits),
+                    _build_prompt(
+                        plan["query"],
+                        reliable_hits,
+                        original_question=request.question.strip(),
+                    ),
                     settings.ollama_base_url,
                     settings.ollama_generation_model,
                     timeout=240.0,

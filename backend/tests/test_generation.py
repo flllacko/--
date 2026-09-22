@@ -137,6 +137,62 @@ class GenerationTest(unittest.TestCase):
         self.assertEqual(result["used_source_ranks"], [1])
         self.assertEqual(len(calls), 1)
 
+    def test_broad_service_intent_gets_natural_guidance(self) -> None:
+        def fake_chat(messages, base_url, model, timeout):
+            self.assertIn("不要只用‘资料未提供’结束回答", messages[0]["content"])
+            return '{"conclusion":"官方资料未提供完整办理流程。","conditions":[],"materials":[],"steps":[],"time":"","notes":[],"follow_up_questions":[],"source_ranks":[1]}'
+
+        retrieval = _retrieval(
+            0.5,
+            ["semantic", "keyword"],
+            text="休学申请需要按学校学籍管理规定办理。",
+        )
+        retrieval["question"] = "我想办休学"
+        retrieval["original_question"] = "我想办休学"
+        result = generate_answer(
+            "我想办休学",
+            retrieval,
+            base_url="http://unused",
+            model="qwen3.5:9b",
+            chat_caller=fake_chat,
+        )
+        conclusion = result["answer"]["conclusion"]
+        self.assertTrue(conclusion.startswith("可以，我来帮你核对休学办理。"))
+        self.assertIn("为了避免一次给你堆太多信息", conclusion)
+        self.assertIn("你想先了解申请条件、所需材料、办理流程，还是时间节点？", conclusion)
+        self.assertEqual(result["used_source_ranks"], [])
+        self.assertEqual(
+            result["answer"]["follow_up_questions"],
+            [
+                "休学需要满足哪些条件？",
+                "休学需要准备哪些材料？",
+                "休学的办理流程是什么？",
+                "休学有哪些时间要求？",
+            ],
+        )
+
+    def test_original_broad_intent_survives_retrieval_query_rewrite(self) -> None:
+        def fake_chat(messages, base_url, model, timeout):
+            self.assertIn("用户只表达了想办理休学", messages[0]["content"])
+            return '{"conclusion":"现有资料未列出完整流程。","conditions":[],"materials":[],"steps":[],"time":"","notes":[],"follow_up_questions":[],"source_ranks":[1]}'
+
+        retrieval = _retrieval(
+            0.5,
+            ["semantic", "keyword"],
+            text="休学申请按照学籍管理规定办理。",
+        )
+        retrieval["question"] = "办理休学的具体流程、材料和时间节点是什么？"
+        retrieval["original_question"] = "我想办休学"
+        result = generate_answer(
+            retrieval["question"],
+            retrieval,
+            base_url="http://unused",
+            model="qwen3.5:9b",
+            chat_caller=fake_chat,
+        )
+        self.assertIn("你想先了解申请条件、所需材料、办理流程，还是时间节点？", result["answer"]["conclusion"])
+        self.assertEqual(result["used_source_ranks"], [])
+
     def test_low_confidence_evidence_refuses_without_calling_model(self) -> None:
         calls = 0
 

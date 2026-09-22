@@ -1287,7 +1287,7 @@ function AnswerPanel({ result, draft, draftAnswer, onFollowUp }: { result: Answe
       <AnswerList label="注意事项" items={answer.notes} />
       {answer.follow_up_questions.length > 0 && (
         <div className="follow-up-panel">
-          <strong>需要补充</strong>
+          <strong>你想继续了解哪一项？</strong>
           <div>{answer.follow_up_questions.map((question) => (
             <button type="button" key={question} disabled={!result} onClick={() => onFollowUp(question)}>{question}</button>
           ))}</div>
