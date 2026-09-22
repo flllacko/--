@@ -872,7 +872,7 @@ function Sidebar({ path, navigate, user }: SidebarProps) {
           <span className="status-dot" />
           本地资料模式
         </div>
-        <div className="version-text">本地问答正式版 · v1.0</div>
+        <div className="version-text">本地问答正式版 · v1.0.0</div>
       </div>
     </aside>
   );

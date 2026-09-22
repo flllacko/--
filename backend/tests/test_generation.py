@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import unittest
 
-from app.qa.generation import _build_prompt, finalize_stream_answer, generate_answer
+from app.qa.generation import (
+    _build_prompt,
+    finalize_stream_answer,
+    generate_answer,
+    reliable_evidence_hits,
+)
 
 
 def _retrieval(distance: float | None, match_types: list[str], text: str = "国家助学金分为三档") -> dict[str, object]:
@@ -25,6 +30,57 @@ def _retrieval(distance: float | None, match_types: list[str], text: str = "国�
 
 
 class GenerationTest(unittest.TestCase):
+    def test_prompt_prioritizes_direct_school_amount_over_general_range(self) -> None:
+        question = "学校 2026 年公开的国家助学金分几档，每档多少钱？"
+        hits = [
+                {
+                    "rank": 1,
+                    "document_id": 1,
+                    "chunk_index": 0,
+                    "title": "国家统一标准",
+                    "module": "学生资助",
+                    "text": "高校可以在每年 2500—5000 元范围内自主确定。",
+                    "locator": "正文",
+                    "source_label": "教育部",
+                    "source_url": "https://www.moe.gov.cn/policy.html",
+                    "published_date": "2024-10-25",
+                    "semantic_distance": 0.4,
+                    "match_types": ["keyword", "semantic"],
+                },
+                {
+                    "rank": 2,
+                    "document_id": 2,
+                    "chunk_index": 0,
+                    "title": "学校 2026 版资助政策简介",
+                    "module": "学生资助",
+                    "text": "国家助学金 4900 元、3700 元、2500 元/人·年，共三档。",
+                    "locator": "政策表格",
+                    "source_label": "成都理工大学工程技术学院官方",
+                    "source_url": "https://zdh.cdutetc.cn/policy.html",
+                    "published_date": "2026-07-06",
+                    "semantic_distance": 0.4,
+                    "match_types": ["keyword", "semantic"],
+                },
+            ]
+        prompt = _build_prompt(question, hits)
+        system = prompt[0]["content"]
+        user = prompt[1]["content"].replace(" ", "")
+        self.assertIn("学校具体资料优先于只给全国一般范围的资料", system)
+        self.assertIn("不能据此前者回答为‘未公开’", system)
+        self.assertIn("4900元、3700元、2500元/人·年", user)
+        self.assertNotIn("2500—5000元范围内自主确定", user)
+
+        retrieval = {
+            "question": question,
+            "retrieval": {
+                "keyword_terms": ["国家助学金", "每档多少钱", "2026"],
+                "core_terms": ["国家助学金", "每档多少钱"],
+            },
+            "hits": hits,
+        }
+        preferred = reliable_evidence_hits(retrieval)
+        self.assertEqual([hit["rank"] for hit in preferred], [2])
+
     def test_prompt_surfaces_multi_part_time_and_fee_evidence(self) -> None:
         prompt = _build_prompt(
             "2026 年四川专升本什么时候报名、缴费和打印准考证？",

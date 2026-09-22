@@ -109,7 +109,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="成都理工大学工程技术学院学生服务问答助手",
-    version="0.1.0",
+    version="1.0.0",
     lifespan=lifespan,
 )
 
@@ -363,7 +363,7 @@ def health() -> dict[str, str]:
     return {
         "status": "ok",
         "phase": "release",
-        "version": "1.0",
+        "version": "1.0.0",
         "app_env": settings.app_env,
         "generation_model": settings.ollama_generation_model,
         "embedding_model": settings.ollama_embedding_model,

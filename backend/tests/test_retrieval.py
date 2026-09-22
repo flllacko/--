@@ -29,6 +29,9 @@ class RetrievalTest(unittest.TestCase):
         scholarship_combination_anchors = _anchor_query_terms(
             "国家奖学金和国家励志奖学金能不能同时获得，能不能同时申请国家助学金？"
         )
+        grant_amount_anchors = _anchor_query_terms(
+            "学校 2026 年公开的国家助学金分几档，每档多少钱？"
+        )
 
         self.assertIn("学士学位证书", admission_anchors)
         self.assertIn("转专业", admission_anchors)
@@ -44,6 +47,9 @@ class RetrievalTest(unittest.TestCase):
         self.assertIn("2026 年 1 月 5 日至 11 日", registration_anchors)
         self.assertIn("准考证", registration_anchors)
         self.assertIn("不能同时获得", scholarship_combination_anchors)
+        self.assertIn("资助标准", grant_amount_anchors)
+        self.assertIn("三档", grant_amount_anchors)
+        self.assertIn("元/人·年", grant_amount_anchors)
 
     def _insert_document(
         self,

@@ -171,6 +171,10 @@ def _priority_query_terms(question: str) -> list[str]:
         marker in normalized for marker in ("休学", "保留学籍", "退学")
     ):
         terms.update(("国家助学金", "休学", "保留学籍", "退学", "停发", "暂停发放", "次月起停发"))
+    if "国家助学金" in normalized and any(
+        marker in normalized for marker in ("金额", "多少钱", "几档", "每档", "标准")
+    ):
+        terms.update(("国家助学金", "资助标准", "三档", "元/人·年", "分档金额"))
     if "勤工助学" in normalized:
         terms.update(("勤工助学", "在岗", "报名", "录用", "公示"))
     if "访客" in normalized and any(marker in normalized for marker in ("时间", "几点", "什么时候")):
@@ -219,6 +223,10 @@ def _anchor_query_terms(question: str) -> tuple[str, ...]:
         )
     if "国家奖学金" in normalized and "国家励志奖学金" in normalized and "同时" in normalized:
         anchors.extend(("不能同时获得", "同时申请并获得国家助学金"))
+    if "国家助学金" in normalized and any(
+        marker in normalized for marker in ("金额", "多少钱", "几档", "每档", "标准")
+    ):
+        anchors.extend(("资助标准", "三档", "元/人·年", "分档金额"))
     mappings = (
         (("国家助学金",), ("国家助学金",)),
         (("国家奖学金", "国家励志奖学金"), ("国家奖学金", "国家励志奖学金", "国家助学金")),
