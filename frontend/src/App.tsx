@@ -255,6 +255,13 @@ function partialAnswer(raw: string): AnswerBody {
   return answer;
 }
 
+function hasVisibleAnswer(answer: AnswerBody): boolean {
+  return Boolean(
+    answer.conclusion || answer.time || answer.conditions.length || answer.materials.length
+    || answer.steps.length || answer.notes.length || answer.follow_up_questions.length,
+  );
+}
+
 function loadActiveGuestTurns(): ChatTurn[] {
   try {
     const raw = sessionStorage.getItem(ACTIVE_GUEST_KEY);
@@ -632,7 +639,9 @@ function App() {
         } else if (eventName === 'delta' && data.text) {
           rawAnswer += data.text;
           const draftAnswer = partialAnswer(rawAnswer);
-          setChatTurns(current => current.map(turn => turn.id === turnId ? { ...turn, draft: draftAnswer.conclusion, draftAnswer } : turn));
+          if (hasVisibleAnswer(draftAnswer)) {
+            setChatTurns(current => current.map(turn => turn.id === turnId ? { ...turn, draft: draftAnswer.conclusion, draftAnswer } : turn));
+          }
           setStreamPreview((current) => current + data.text);
         } else if (eventName === 'final') {
           finalResult.value = data as AnswerResponse;
@@ -863,7 +872,7 @@ function Sidebar({ path, navigate, user }: SidebarProps) {
           <span className="status-dot" />
           本地资料模式
         </div>
-        <div className="version-text">P7 账号与会话 · v0.1</div>
+        <div className="version-text">本地问答正式版 · v1.0</div>
       </div>
     </aside>
   );

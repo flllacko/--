@@ -362,7 +362,8 @@ def _dialogue_plan(request, user, draft=True):
 def health() -> dict[str, str]:
     return {
         "status": "ok",
-        "phase": "P7",
+        "phase": "release",
+        "version": "1.0",
         "app_env": settings.app_env,
         "generation_model": settings.ollama_generation_model,
         "embedding_model": settings.ollama_embedding_model,
