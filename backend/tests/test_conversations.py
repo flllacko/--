@@ -176,8 +176,8 @@ class AnswerPersistenceTests(unittest.TestCase):
             planner.start()
             try:
                 with patch.object(main_module, "search_knowledge", return_value=retrieval), patch.object(
-                    main_module, "generate_answer", return_value=generated
-                ):
+                    main_module, "review_evidence", return_value={"action": "answer", "query": "", "clarification": "", "relevant_ranks": None}
+                ), patch.object(main_module, "generate_answer", return_value=generated):
                     logged_result = main_module.answer(
                         main_module.SearchRequest(question="登录用户问题"),
                         request_with_token(token),

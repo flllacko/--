@@ -6,6 +6,11 @@ from app.qa.query_routing import is_known_current_gap, resolve_scope
 
 
 class QueryRoutingTest(unittest.TestCase):
+    def test_employment_site_sections_use_navigation_scope(self) -> None:
+        self.assertEqual(resolve_scope("学校就业网能看到哪些学生服务？", "current"), "navigation")
+        self.assertEqual(resolve_scope("就业信息网有哪些栏目？", "current"), "navigation")
+        self.assertEqual(resolve_scope("2027届毕业生就业手续怎么办？", "current"), "current")
+
     def test_explicit_historical_query_uses_historical_scope(self) -> None:
         self.assertEqual(
             resolve_scope("按 2023 年公开附件，申请在校外住宿需要哪些材料？", "current"),

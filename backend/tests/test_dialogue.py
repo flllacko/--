@@ -35,5 +35,62 @@ class DialogueTests(unittest.TestCase):
     def test_router_prompt_does_not_expand_unasked_details(self):
         with patch('app.qa.dialogue._call_ollama_chat', return_value='{"mode":"school","query":"我想办理休学","reply":""}') as caller:
             result = plan_dialogue('我想办休学', [], base_url='http://localhost', model='test')
-        self.assertEqual(result['query'], '我想办理休学')
+        self.assertEqual(result['query'], '我想办休学')
         self.assertIn('不能擅自增加用户没有询问的材料、流程、时间、条件或结论', caller.call_args.args[0][0]['content'])
+
+    def test_first_turn_does_not_accept_model_invented_facets(self):
+        result = self.plan(
+            '{"mode":"school","action":"answer",'
+            '"query":"办理休学的流程、材料和时间节点是什么？",'
+            '"reply":"","clarification":""}', '我想办休学',
+        )
+        self.assertEqual(result['query'], '我想办休学')
+
+    def test_rewritten_follow_up_cannot_change_explicit_year(self):
+        with patch('app.qa.dialogue._call_ollama_chat', return_value=(
+            '{"mode":"school","action":"answer","depth":"specific",'
+            '"facets":["time"],"query":"2026届就业手续什么时候办理？",'
+            '"reply":"","clarification":""}'
+        )):
+            result = plan_dialogue(
+                '2027届就业手续什么时候办理？',
+                [{'role': 'user', 'content': '上一轮问过2026届'}],
+                base_url='http://localhost', model='test',
+            )
+        self.assertEqual(result['query'], '2027届就业手续什么时候办理？')
+
+    def test_clear_school_request_is_not_forced_to_clarify(self):
+        result = self.plan(
+            '{"mode":"general","action":"answer","depth":"overview","facets":[],"query":"我想办休学","reply":"","clarification":""}',
+            '我想办休学',
+        )
+        self.assertEqual(result['mode'], 'school')
+        self.assertEqual(result['action'], 'answer')
+        self.assertEqual(result['depth'], 'overview')
+
+    def test_model_can_request_one_targeted_clarification(self):
+        result = self.plan(
+            '{"mode":"general","action":"answer","query":"学校办理时间","reply":"",'
+            '"clarification":"你是想问休学办理时间，还是复学办理时间？"}',
+            '学校办理时间是什么时候？',
+        )
+        self.assertEqual(result['mode'], 'school')
+        self.assertEqual(result['action'], 'clarify')
+        self.assertIn('休学办理时间', result['clarification'])
+
+    def test_known_evidence_gap_cannot_be_relabelled_as_ambiguity(self):
+        result = self.plan(
+            '{"mode":"school","action":"clarify","query":"寝室几点熄灯","reply":"",'
+            '"clarification":"你想问哪栋宿舍？"}',
+            '寝室几点熄灯？',
+        )
+        self.assertEqual(result['action'], 'answer')
+
+    def test_explicit_step_question_cannot_be_collapsed_to_overview(self):
+        result = self.plan(
+            '{"mode":"school","action":"answer","depth":"overview",'
+            '"facets":["steps"],"query":"2027届就业手续怎么办",'
+            '"reply":"","clarification":""}',
+            '2027届就业手续怎么办？',
+        )
+        self.assertEqual(result['depth'], 'specific')

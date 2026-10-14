@@ -255,13 +255,6 @@ function partialAnswer(raw: string): AnswerBody {
   return answer;
 }
 
-function hasVisibleAnswer(answer: AnswerBody): boolean {
-  return Boolean(
-    answer.conclusion || answer.time || answer.conditions.length || answer.materials.length
-    || answer.steps.length || answer.notes.length || answer.follow_up_questions.length,
-  );
-}
-
 function loadActiveGuestTurns(): ChatTurn[] {
   try {
     const raw = sessionStorage.getItem(ACTIVE_GUEST_KEY);
@@ -639,10 +632,17 @@ function App() {
         } else if (eventName === 'delta' && data.text) {
           rawAnswer += data.text;
           const draftAnswer = partialAnswer(rawAnswer);
-          if (hasVisibleAnswer(draftAnswer)) {
-            setChatTurns(current => current.map(turn => turn.id === turnId ? { ...turn, draft: draftAnswer.conclusion, draftAnswer } : turn));
+          // 结构字段可能在最终证据校验时被裁掉；流式阶段只展示给用户的结论，
+          // 避免条件/材料先出现又突然消失，来源片段始终等 final 后折叠展示。
+          if (draftAnswer.conclusion) {
+            setChatTurns(current => current.map(turn => turn.id === turnId
+              ? { ...turn, draft: draftAnswer.conclusion } : turn));
           }
           setStreamPreview((current) => current + data.text);
+        } else if (eventName === 'answer_reset') {
+          setChatTurns(current => current.map(turn => turn.id === turnId
+            ? { ...turn, draft: '', draftAnswer: undefined,
+                progress: data.label ? [...turn.progress, data.label] : turn.progress } : turn));
         } else if (eventName === 'final') {
           finalResult.value = data as AnswerResponse;
         } else if (eventName === 'error') {

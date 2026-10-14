@@ -60,7 +60,8 @@ from app.qa.generation import (
     stream_ollama_chat,
     structure_answer,
 )
-from app.qa.query_routing import is_greeting_query, resolve_scope
+from app.qa.agentic import keep_relevant_hits, merge_retrievals, review_evidence
+from app.qa.query_routing import is_greeting_query, is_known_current_gap, resolve_scope
 from app.qa.dialogue import plan_dialogue, general_messages
 from app.qa.retrieval import RetrievalError, search_knowledge
 from app.processing.metadata import MetadataError, update_document_metadata
@@ -356,6 +357,91 @@ def _dialogue_plan(request, user, draft=True):
                         model=settings.ollama_generation_model, private=request.use_private_knowledge, draft=draft)
     plan["history"] = history
     return plan
+
+
+def _clarification_payload(
+    request: SearchRequest, http_request: Request, user, clarification: str,
+) -> dict[str, object]:
+    answer_body = {
+        "conclusion": clarification,
+        "conditions": [], "materials": [], "steps": [], "time": "", "notes": [],
+        "follow_up_questions": [],
+    }
+    saved, conversation_id = _save_answer_if_logged_in(
+        http_request, user, question=request.question, answer=answer_body,
+        answer_status="completed", sources=[], identity=request.identity,
+        conversation_id=request.conversation_id,
+    )
+    return {
+        "question": request.question.strip(), "answer_status": "completed",
+        "answer": answer_body, "sources": [], "retrieval": {"hit_count": 0},
+        "saved": saved, "conversation_id": conversation_id,
+    }
+
+
+def _clarification_stream(
+    request: SearchRequest, http_request: Request, user, clarification: str,
+) -> StreamingResponse:
+    def events():
+        yield _sse("progress", {"stage": "understanding", "label": "正在确认你的问题"})
+        yield _sse("answer_delta", {"text": clarification})
+        payload = _clarification_payload(request, http_request, user, clarification)
+        yield _sse("final", payload)
+        yield _sse("done", {"saved": payload["saved"], "conversation_id": payload["conversation_id"]})
+
+    return StreamingResponse(
+        events(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _school_retrieval(
+    request: SearchRequest, user, query: str, depth: str = "specific",
+    facets: list[str] | None = None,
+) -> tuple[dict[str, object], str]:
+    """检索并让模型至多建议一次换词；所有调用沿用原问题的权限和范围。"""
+
+    scope = resolve_scope(query, request.scope)
+    owner_user_id = int(user["id"]) if request.use_private_knowledge and user and user["role"] == "user" else None
+    include_private = bool(request.use_private_knowledge and user and user["role"] == "user")
+
+    def search(text: str) -> dict[str, object]:
+        result = search_knowledge(
+            text, db_path=settings.sqlite_path, index_path=settings.lancedb_path,
+            ollama_base_url=settings.ollama_base_url,
+            embedding_model=settings.ollama_embedding_model,
+            scope=scope, limit=request.limit, owner_user_id=owner_user_id,
+            include_private=include_private,
+        )
+        result["original_question"] = request.question.strip()
+        result["answer_depth"] = depth
+        result["requested_facets"] = facets or []
+        return result
+
+    # 栏目问题使用入口资料范围；“就业网”是“就业信息网”的常用简称，
+    # 只规范检索词，不改变用户原问题或将入口页升级为政策依据。
+    search_query = query.replace("就业网", "就业信息网") if scope == "navigation" else query
+    retrieval = search(search_query)
+    # 已核实的现行资料缺口不能靠换关键词或相邻历史通知绕开。
+    if is_known_current_gap(request.question) or is_known_current_gap(query):
+        return retrieval, ""
+    review = review_evidence(
+        request.question, retrieval, base_url=settings.ollama_base_url,
+        model=settings.ollama_generation_model, facets=facets,
+    )
+    if review["action"] == "clarify":
+        return retrieval, review["clarification"]
+    if review["action"] == "retry":
+        retried = search(review["query"])
+        retrieval = merge_retrievals(retrieval, retried, limit=request.limit)
+        second_review = review_evidence(
+            request.question, retrieval, base_url=settings.ollama_base_url,
+            model=settings.ollama_generation_model, allow_retry=False, facets=facets,
+        )
+        if second_review["action"] == "clarify":
+            return retrieval, second_review["clarification"]
+        return keep_relevant_hits(retrieval, second_review["relevant_ranks"]), ""
+    return keep_relevant_hits(retrieval, review["relevant_ranks"]), ""
 
 
 @app.get("/api/health")
@@ -1248,19 +1334,13 @@ def answer(request: SearchRequest, http_request: Request) -> dict[str, object]:
         plan = _dialogue_plan(request, user)
         if plan["mode"] == "general":
             return _greeting_payload(request, http_request, user, plan["reply"])
-        scope = resolve_scope(plan["query"], request.scope)
-        retrieval = search_knowledge(
-            plan["query"],
-            db_path=settings.sqlite_path,
-            index_path=settings.lancedb_path,
-            ollama_base_url=settings.ollama_base_url,
-            embedding_model=settings.ollama_embedding_model,
-            scope=scope,
-            limit=request.limit,
-            owner_user_id=int(user["id"]) if request.use_private_knowledge and user and user["role"] == "user" else None,
-            include_private=bool(request.use_private_knowledge and user and user["role"] == "user"),
+        if plan.get("action") == "clarify":
+            return _clarification_payload(request, http_request, user, plan["clarification"])
+        retrieval, clarification = _school_retrieval(
+            request, user, plan["query"], plan.get("depth", "specific"), plan.get("facets", [])
         )
-        retrieval["original_question"] = request.question.strip()
+        if clarification:
+            return _clarification_payload(request, http_request, user, clarification)
         generated = generate_answer(
             plan["query"],
             retrieval,
@@ -1340,25 +1420,10 @@ def answer_stream(request: SearchRequest, http_request: Request) -> StreamingRes
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-    try:
-        scope = resolve_scope(plan["query"], request.scope)
-        retrieval = search_knowledge(
-            plan["query"],
-            db_path=settings.sqlite_path,
-            index_path=settings.lancedb_path,
-            ollama_base_url=settings.ollama_base_url,
-            embedding_model=settings.ollama_embedding_model,
-            scope=scope,
-            limit=request.limit,
-            owner_user_id=int(user["id"]) if request.use_private_knowledge and user and user["role"] == "user" else None,
-            include_private=bool(request.use_private_knowledge and user and user["role"] == "user"),
-        )
-        retrieval["original_question"] = request.question.strip()
-    except (ValueError, RetrievalError) as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if plan.get("action") == "clarify":
+        return _clarification_stream(request, http_request, user, plan["clarification"])
 
-    def events():
-        yield _sse("progress", {"stage": "retrieving", "label": "正在检索学校官方资料"})
+    def events(retrieval: dict[str, object]):
         if not has_reliable_evidence(retrieval):
             yield _sse("progress", {"stage": "checking", "label": "正在核对资料适用范围"})
             result = structure_answer("", retrieval)
@@ -1389,6 +1454,7 @@ def answer_stream(request: SearchRequest, http_request: Request) -> StreamingRes
         reliable_hits = reliable_evidence_hits(retrieval)
         yield _sse("progress", {"stage": "checking", "label": "已找到资料，正在核对证据"})
         raw_parts: list[str] = []
+        repaired_stream = False
         try:
             yield _sse("progress", {"stage": "answering", "label": "正在组织回答"})
             try:
@@ -1397,6 +1463,8 @@ def answer_stream(request: SearchRequest, http_request: Request) -> StreamingRes
                         plan["query"],
                         reliable_hits,
                         original_question=request.question.strip(),
+                        overview=retrieval.get("answer_depth") == "overview",
+                        facets=retrieval.get("requested_facets") or [],
                     ),
                     settings.ollama_base_url,
                     settings.ollama_generation_model,
@@ -1414,6 +1482,7 @@ def answer_stream(request: SearchRequest, http_request: Request) -> StreamingRes
                         base_url=settings.ollama_base_url,
                         model=settings.ollama_generation_model,
                     )
+                    repaired_stream = True
                 except GenerationError as fallback_error:
                     raise stream_error from fallback_error
             else:
@@ -1424,6 +1493,13 @@ def answer_stream(request: SearchRequest, http_request: Request) -> StreamingRes
                     base_url=settings.ollama_base_url,
                     model=settings.ollama_generation_model,
                 )
+            try:
+                provisional = json.loads("".join(raw_parts))
+                streamed_conclusion = provisional.get("conclusion") if isinstance(provisional, dict) else None
+            except (json.JSONDecodeError, ValueError):
+                streamed_conclusion = None
+            if raw_parts and (repaired_stream or streamed_conclusion != result["answer"]["conclusion"]):
+                yield _sse("answer_reset", {"label": "初稿已重新校验，正在显示最终回答"})
             sources = _sources_for_ranks(retrieval, result["used_source_ranks"])
             saved, saved_conversation_id = _save_answer_if_logged_in(
                 http_request,
@@ -1452,8 +1528,26 @@ def answer_stream(request: SearchRequest, http_request: Request) -> StreamingRes
         except (GenerationError, ValueError) as exc:
             yield _sse("error", {"message": str(exc), "saved": False})
 
+    def scheduled_events():
+        yield _sse("progress", {"stage": "retrieving", "label": "正在检索并核对学校资料"})
+        try:
+            retrieval, clarification = _school_retrieval(
+                request, user, plan["query"], plan.get("depth", "specific"), plan.get("facets", [])
+            )
+        except (ValueError, RetrievalError, GenerationError) as exc:
+            yield _sse("error", {"message": str(exc), "saved": False})
+            return
+        if clarification:
+            yield _sse("progress", {"stage": "understanding", "label": "正在确认你想问的事项"})
+            yield _sse("answer_delta", {"text": clarification})
+            payload = _clarification_payload(request, http_request, user, clarification)
+            yield _sse("final", payload)
+            yield _sse("done", {"saved": payload["saved"], "conversation_id": payload["conversation_id"]})
+            return
+        yield from events(retrieval)
+
     return StreamingResponse(
-        events(),
+        scheduled_events(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

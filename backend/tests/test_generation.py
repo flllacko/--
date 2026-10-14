@@ -7,6 +7,7 @@ from app.qa.generation import (
     finalize_stream_answer,
     generate_answer,
     reliable_evidence_hits,
+    structure_answer,
 )
 
 
@@ -30,6 +31,20 @@ def _retrieval(distance: float | None, match_types: list[str], text: str = "国�
 
 
 class GenerationTest(unittest.TestCase):
+    def test_material_question_does_not_show_other_facets_or_reinstatement_material(self) -> None:
+        value = _retrieval(0.5, ["semantic"], text="休学申请填写休学审批表。")
+        value["question"] = "休学需要哪些材料？"
+        value["requested_facets"] = ["materials"]
+        raw = ('{"conclusion":"目前只能确认休学审批表。",'
+               '"conditions":["符合条件"],"materials":["休学审批表","复学时需提交三甲医院证明"],'
+               '"steps":["先审批"],"time":"5天","notes":["其他提醒"],'
+               '"follow_up_questions":[],"source_ranks":[1]}')
+        result = structure_answer(raw, value)
+        self.assertEqual(result["answer"]["materials"], ["休学审批表"])
+        for field in ("conditions", "steps", "notes"):
+            self.assertEqual(result["answer"][field], [])
+        self.assertEqual(result["answer"]["time"], "")
+
     def test_prompt_prioritizes_direct_school_amount_over_general_range(self) -> None:
         question = "学校 2026 年公开的国家助学金分几档，每档多少钱？"
         hits = [
@@ -137,10 +152,10 @@ class GenerationTest(unittest.TestCase):
         self.assertEqual(result["used_source_ranks"], [1])
         self.assertEqual(len(calls), 1)
 
-    def test_broad_service_intent_gets_natural_guidance(self) -> None:
+    def test_broad_service_intent_keeps_grounded_model_answer(self) -> None:
         def fake_chat(messages, base_url, model, timeout):
-            self.assertIn("不要只用‘资料未提供’结束回答", messages[0]["content"])
-            return '{"conclusion":"官方资料未提供完整办理流程。","conditions":[],"materials":[],"steps":[],"time":"","notes":[],"follow_up_questions":[],"source_ranks":[1]}'
+            self.assertIn("先利用片段回答能够确认的核心信息", messages[0]["content"])
+            return '{"conclusion":"学校学籍管理规定提及休学申请，但当前片段没有完整材料清单。","conditions":[],"materials":[],"steps":[],"time":"","notes":[],"follow_up_questions":["休学的申请条件是什么？"],"source_ranks":[1]}'
 
         retrieval = _retrieval(
             0.5,
@@ -157,24 +172,15 @@ class GenerationTest(unittest.TestCase):
             chat_caller=fake_chat,
         )
         conclusion = result["answer"]["conclusion"]
-        self.assertTrue(conclusion.startswith("可以，我来帮你核对休学办理。"))
-        self.assertIn("为了避免一次给你堆太多信息", conclusion)
-        self.assertIn("你想先了解申请条件、所需材料、办理流程，还是时间节点？", conclusion)
-        self.assertEqual(result["used_source_ranks"], [])
-        self.assertEqual(
-            result["answer"]["follow_up_questions"],
-            [
-                "休学需要满足哪些条件？",
-                "休学需要准备哪些材料？",
-                "休学的办理流程是什么？",
-                "休学有哪些时间要求？",
-            ],
-        )
+        self.assertIn("休学申请", conclusion)
+        self.assertNotIn("你想先了解申请条件", conclusion)
+        self.assertEqual(result["used_source_ranks"], [1])
+        self.assertEqual(result["answer"]["follow_up_questions"], ["休学的申请条件是什么？"])
 
     def test_original_broad_intent_survives_retrieval_query_rewrite(self) -> None:
         def fake_chat(messages, base_url, model, timeout):
-            self.assertIn("用户只表达了想办理休学", messages[0]["content"])
-            return '{"conclusion":"现有资料未列出完整流程。","conditions":[],"materials":[],"steps":[],"time":"","notes":[],"follow_up_questions":[],"source_ranks":[1]}'
+            self.assertIn("用户问题：办理休学的具体流程", messages[1]["content"])
+            return '{"conclusion":"现有资料只说明休学申请按照学籍管理规定办理，未列出完整流程。","conditions":[],"materials":[],"steps":[],"time":"","notes":[],"follow_up_questions":[],"source_ranks":[1]}'
 
         retrieval = _retrieval(
             0.5,
@@ -190,8 +196,8 @@ class GenerationTest(unittest.TestCase):
             model="qwen3.5:9b",
             chat_caller=fake_chat,
         )
-        self.assertIn("你想先了解申请条件、所需材料、办理流程，还是时间节点？", result["answer"]["conclusion"])
-        self.assertEqual(result["used_source_ranks"], [])
+        self.assertIn("未列出完整流程", result["answer"]["conclusion"])
+        self.assertEqual(result["used_source_ranks"], [1])
 
     def test_low_confidence_evidence_refuses_without_calling_model(self) -> None:
         calls = 0

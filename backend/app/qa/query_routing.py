@@ -172,13 +172,17 @@ def is_explicit_historical_query(question: str) -> bool:
 
 
 def is_navigation_query(question: str) -> bool:
-    """识别只要求招生公开入口或查询页面的问题。"""
+    """识别询问公开网站入口或栏目本身的问题，不把入口当政策正文。"""
 
     normalized = _normalized(question)
     if "专业设置页" in normalized:
         return True
-    return "录取查询系统" in normalized and any(
+    if "录取查询系统" in normalized and any(
         marker in normalized for marker in ("入口", "在哪里", "在哪看", "怎么查")
+    ):
+        return True
+    return any(site in normalized for site in ("就业网", "就业信息网", "招生网", "学校官网")) and any(
+        intent in normalized for intent in ("哪些服务", "有哪些", "哪些栏目", "能看到", "入口")
     )
 
 
